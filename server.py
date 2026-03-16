@@ -2,6 +2,7 @@ import asyncio
 import atexit
 import os
 import re
+import signal
 import shutil
 import subprocess
 import sys
@@ -150,13 +151,44 @@ class JuliaSession:
             try:
                 return await asyncio.wait_for(read_until_sentinel(), timeout=timeout)
             except asyncio.TimeoutError:
-                self.process.kill()
-                await self.process.wait()
+                # Try to interrupt gracefully before killing.
+                # Send two SIGINTs in quick succession -- Julia doesn't
+                # always respond to a single one (e.g., inside try/catch
+                # blocks that swallow InterruptException).
                 partial = "\n".join(lines)
-                msg = f"Execution timed out after {timeout}s. Session killed; it will restart on next call."
-                if partial:
-                    msg += f"\n\nOutput before timeout:\n{partial}"
-                raise RuntimeError(msg)
+                try:
+                    self.process.send_signal(signal.SIGINT)
+                    await asyncio.sleep(0.1)
+                    self.process.send_signal(signal.SIGINT)
+                    # Give Julia time to handle the interrupt and print
+                    # the sentinel from the queued sentinel_cmd
+                    result = await asyncio.wait_for(
+                        read_until_sentinel(), timeout=10.0
+                    )
+                    # Interrupt succeeded -- session is still alive
+                    partial = "\n".join(lines)
+                    msg = (
+                        f"Execution timed out after {timeout}s and was "
+                        f"interrupted. Session is still alive."
+                    )
+                    if partial:
+                        msg += f"\n\nOutput before timeout:\n{partial}"
+                    raise RuntimeError(msg)
+                except (asyncio.TimeoutError, ProcessLookupError, OSError):
+                    # Interrupt didn't work -- kill as last resort
+                    try:
+                        self.process.kill()
+                        await self.process.wait()
+                    except ProcessLookupError:
+                        pass
+                    msg = (
+                        f"Execution timed out after {timeout}s. "
+                        f"Interrupt failed; session killed. "
+                        f"It will restart on next call."
+                    )
+                    if partial:
+                        msg += f"\n\nOutput before timeout:\n{partial}"
+                    raise RuntimeError(msg)
         else:
             return await read_until_sentinel()
 
