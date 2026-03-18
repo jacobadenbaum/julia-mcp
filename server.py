@@ -1,5 +1,6 @@
 import asyncio
 import atexit
+import getpass
 import os
 import re
 import signal
@@ -9,6 +10,7 @@ import sys
 import tempfile
 import time
 import uuid
+from dataclasses import dataclass
 from io import TextIOWrapper
 from pathlib import Path
 
@@ -18,6 +20,23 @@ DEFAULT_TIMEOUT = 60.0
 DEFAULT_JULIA_ARGS = ("--startup-file=no", "--threads=auto")
 PKG_PATTERN = re.compile(r"\bPkg\.")
 TEMP_SESSION_KEY = "__temp__"
+SENTINEL_BASE = Path(tempfile.gettempdir()) / ".julia-mcp-jobs" / getpass.getuser()
+SERVER_UUID = uuid.uuid4().hex[:16]
+
+
+@dataclass
+class BackgroundJob:
+    job_id: str
+    env_path: str | None
+    started_at: float
+    lines: list[str]
+    status: str  # "running" | "completed" | "error"
+    result: str | None
+    error: str | None
+    reader_task: asyncio.Task | None
+    delivered: bool
+    sentinel_path: Path
+
 
 mcp = FastMCP("julia")
 
@@ -208,6 +227,16 @@ class SessionManager:
         self._global_lock = asyncio.Lock()
         self._log_dir = tempfile.mkdtemp(prefix="julia-mcp-logs-")
         self._log_files: dict[str, TextIOWrapper] = {}
+        self._sentinel_dir = SENTINEL_BASE / SERVER_UUID
+        self._sentinel_dir.mkdir(parents=True, exist_ok=True)
+        self._completed_jobs: dict[str, BackgroundJob] = {}
+        # Clean up stale sentinel dirs from crashed previous runs
+        for stale in SENTINEL_BASE.iterdir():
+            if stale != self._sentinel_dir and stale.is_dir():
+                try:
+                    shutil.rmtree(stale)
+                except OSError:
+                    pass
         atexit.register(self._cleanup_logs)
 
     def _get_log_file(self, key: str) -> TextIOWrapper:
@@ -296,6 +325,8 @@ class SessionManager:
         for session in self._sessions.values():
             await session.kill()
         self._sessions.clear()
+        shutil.rmtree(self._sentinel_dir, ignore_errors=True)
+        self._completed_jobs.clear()
         self._cleanup_logs()
 
 

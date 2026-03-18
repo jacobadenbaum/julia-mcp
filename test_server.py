@@ -11,7 +11,7 @@ import pytest_asyncio
 from mcp.shared.memory import create_connected_server_and_client_session
 
 import server as server_mod
-from server import JuliaSession, SessionManager, TEMP_SESSION_KEY
+from server import BackgroundJob, JuliaSession, SessionManager, TEMP_SESSION_KEY
 
 
 # -- Helpers --
@@ -375,6 +375,30 @@ class TestTimeoutDetection:
     )
     def test_pkg_pattern_no_match(self, code: str):
         assert not self.PKG_PATTERN.search(code)
+
+
+# -- BackgroundJob tests --
+
+
+class TestBackgroundJob:
+    def test_create_background_job(self):
+        from pathlib import Path
+
+        job = BackgroundJob(
+            job_id="abc12345",
+            env_path=None,
+            started_at=1000.0,
+            lines=[],
+            status="running",
+            result=None,
+            error=None,
+            reader_task=None,
+            delivered=False,
+            sentinel_path=Path("/tmp/test.sentinel"),
+        )
+        assert job.status == "running"
+        assert job.job_id == "abc12345"
+        assert job.delivered is False
 
 
 # -- End-to-end MCP tool tests --
