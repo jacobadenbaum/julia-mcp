@@ -220,6 +220,9 @@ class JuliaSession:
         """Create a BackgroundJob wrapping an existing or new reader task."""
         job_id = uuid.uuid4().hex[:8]
         sentinel_path = manager._sentinel_dir / f"{job_id}.sentinel"
+        output_path = manager._sentinel_dir / f"{job_id}.log"
+        # Create the output file immediately so tail -f can attach
+        output_path.touch()
         job = BackgroundJob(
             job_id=job_id,
             env_path=None if self.is_temp else self.env_dir,
@@ -240,7 +243,32 @@ class JuliaSession:
                 self._read_until_sentinel(reader_task_or_lines)
             )
 
+        async def _flush_output():
+            """Periodically flush accumulated lines to the output file."""
+            flushed = 0
+            while job.status == "running":
+                current = len(job.lines)
+                if current > flushed:
+                    try:
+                        with open(output_path, "a") as f:
+                            for line in job.lines[flushed:current]:
+                                f.write(line + "\n")
+                    except OSError:
+                        pass
+                    flushed = current
+                await asyncio.sleep(1)
+            # Final flush
+            current = len(job.lines)
+            if current > flushed:
+                try:
+                    with open(output_path, "a") as f:
+                        for line in job.lines[flushed:current]:
+                            f.write(line + "\n")
+                except OSError:
+                    pass
+
         async def _run_bg():
+            flusher = asyncio.create_task(_flush_output())
             try:
                 output = await existing_reader
                 job.result = output
@@ -249,6 +277,7 @@ class JuliaSession:
                 job.error = str(e)
                 job.status = "error"
             finally:
+                await flusher
                 self._write_sentinel(job)
                 self._background_job = None
                 if self._log_file:
