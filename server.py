@@ -439,15 +439,17 @@ async def julia_eval(
     env_path: str | None = None,
     timeout: float | None = None,
 ) -> str:
-    """ALWAYS use this tool to run Julia code. NEVER run julia via command line.
+    """Execute Julia code in a persistent REPL session.
 
-    Persistent REPL session with state preserved between calls.
-    Each env_path gets its own session, started lazily.
+    Each env_path gets its own session, started lazily. State persists between calls.
+    Long-running jobs auto-background on timeout instead of being killed.
 
     Args:
         code: Julia code to evaluate. Use display(...)/println(...) to see output.
         env_path: Julia project directory path. Omit for a temporary environment.
-        timeout: Seconds (default: 60). Auto-disabled for Pkg operations.
+        timeout: Seconds before auto-backgrounding (default: 60).
+            Set to 0 to background immediately.
+            Auto-disabled for Pkg operations.
     """
     if timeout is None:
         effective_timeout: float | None = (

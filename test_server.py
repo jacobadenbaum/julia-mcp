@@ -593,3 +593,19 @@ class TestMCPTools:
                 "julia_eval", {"code": "println(1)", "timeout": 5.0}
             )
             assert "busy" in result2.content[0].text.lower()
+
+    async def test_eval_timeout_zero_backgrounds(self):
+        async with mcp_client_session() as client:
+            result = await client.call_tool(
+                "julia_eval", {"code": "println(\"hello\")", "timeout": 0}
+            )
+            assert "[BACKGROUNDED]" in result.content[0].text
+
+    async def test_eval_timeout_none_uses_default(self):
+        """Omitting timeout should use the default (60s), not background."""
+        async with mcp_client_session() as client:
+            result = await client.call_tool(
+                "julia_eval", {"code": "println(\"fast\")"}
+            )
+            assert "fast" in result.content[0].text
+            assert "[BACKGROUNDED]" not in result.content[0].text
