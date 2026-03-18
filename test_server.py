@@ -121,10 +121,11 @@ class TestJuliaSession:
         result = await s2.execute("println(1 + 1)", timeout=30.0)
         assert result == "2"
 
-    async def test_timeout_kills_session(self, session: JuliaSession):
+    async def test_timeout_raises_but_session_survives(self, session: JuliaSession):
         with pytest.raises(RuntimeError, match="timed out"):
             await session.execute("sleep(60)", timeout=2.0)
-        assert not session.is_alive()
+        # Session stays alive so it can be reused or backgrounded
+        assert session.is_alive()
 
     async def test_is_alive(self, session: JuliaSession):
         assert session.is_alive()

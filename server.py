@@ -41,6 +41,14 @@ class BackgroundJob:
 mcp = FastMCP("julia")
 
 
+@dataclass
+class _TimeoutResult:
+    """Internal: returned when _execute_raw times out instead of completing."""
+    reader_task: asyncio.Task
+    lines: list[str]
+    timeout: float
+
+
 class JuliaSession:
     def __init__(
         self,
@@ -129,18 +137,62 @@ class JuliaSession:
                 ts = time.strftime("%H:%M:%S")
                 self._log_file.write(f"[{ts}] julia> {code}\n")
                 self._log_file.flush()
-            output = await self._execute_raw(wrapped, timeout)
+
+            result = await self._execute_raw(wrapped, timeout)
+
+            if isinstance(result, _TimeoutResult):
+                # Temporary: maintain old behavior until auto-backgrounding is added in Task 3
+                partial = "\n".join(result.lines)
+                # Cancel the reader and interrupt Julia
+                result.reader_task.cancel()
+                try:
+                    await result.reader_task
+                except (asyncio.CancelledError, RuntimeError):
+                    pass
+                try:
+                    self.process.send_signal(signal.SIGINT)
+                    await asyncio.sleep(0.1)
+                    self.process.send_signal(signal.SIGINT)
+                except (ProcessLookupError, OSError):
+                    pass
+                msg = f"Execution timed out after {result.timeout}s."
+                if partial:
+                    msg += f"\n\nOutput before timeout:\n{partial}"
+                raise RuntimeError(msg)
+
+            output = result
             if self._log_file and output:
                 self._log_file.write(f"{output}\n\n")
                 self._log_file.flush()
             return output
 
-    async def _execute_raw(self, code: str, timeout: float | None) -> str:
+    async def _read_until_sentinel(self, lines: list[str]) -> str:
+        """Read stdout lines until the sentinel marker appears."""
+        while True:
+            raw = await self.process.stdout.readline()
+            if not raw:
+                collected = "\n".join(lines)
+                raise RuntimeError(
+                    f"Julia process died during execution.\n"
+                    f"Output before death:\n{collected}"
+                )
+            line = raw.decode().rstrip("\n").rstrip("\r")
+            if line == self.sentinel:
+                break
+            lines.append(line)
+        if lines and lines[-1] == "":
+            lines.pop()
+        return "\n".join(lines)
+
+    async def _execute_raw(
+        self, code: str, timeout: float | None
+    ) -> str | _TimeoutResult:
         assert self.process is not None
         assert self.process.stdin is not None
 
         sentinel_cmd = (
-            f'flush(stderr); write(stdout, "\\n"); println(stdout, "{self.sentinel}"); flush(stdout)'
+            f'flush(stderr); write(stdout, "\\n"); '
+            f'println(stdout, "{self.sentinel}"); flush(stdout)'
         )
         payload = code + "\n" + sentinel_cmd + "\n"
         self.process.stdin.write(payload.encode())
@@ -148,68 +200,33 @@ class JuliaSession:
 
         lines: list[str] = []
 
-        async def read_until_sentinel() -> str:
-            while True:
-                raw = await self.process.stdout.readline()
-                if not raw:
-                    collected = "\n".join(lines)
-                    raise RuntimeError(
-                        f"Julia process died during execution.\n"
-                        f"Output before death:\n{collected}"
-                    )
-                line = raw.decode().rstrip("\n").rstrip("\r")
-                if line == self.sentinel:
-                    break
-                lines.append(line)
-            # The extra \n before sentinel may leave a trailing empty line
-            if lines and lines[-1] == "":
-                lines.pop()
-            return "\n".join(lines)
+        if timeout is not None and timeout > 0:
+            reader_task = asyncio.create_task(
+                self._read_until_sentinel(lines)
+            )
+            timer_task = asyncio.create_task(asyncio.sleep(timeout))
 
-        if timeout is not None:
-            try:
-                return await asyncio.wait_for(read_until_sentinel(), timeout=timeout)
-            except asyncio.TimeoutError:
-                # Try to interrupt gracefully before killing.
-                # Send two SIGINTs in quick succession -- Julia doesn't
-                # always respond to a single one (e.g., inside try/catch
-                # blocks that swallow InterruptException).
-                partial = "\n".join(lines)
+            done, pending = await asyncio.wait(
+                {reader_task, timer_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+
+            if reader_task in done:
+                timer_task.cancel()
                 try:
-                    self.process.send_signal(signal.SIGINT)
-                    await asyncio.sleep(0.1)
-                    self.process.send_signal(signal.SIGINT)
-                    # Give Julia time to handle the interrupt and print
-                    # the sentinel from the queued sentinel_cmd
-                    result = await asyncio.wait_for(
-                        read_until_sentinel(), timeout=10.0
-                    )
-                    # Interrupt succeeded -- session is still alive
-                    partial = "\n".join(lines)
-                    msg = (
-                        f"Execution timed out after {timeout}s and was "
-                        f"interrupted. Session is still alive."
-                    )
-                    if partial:
-                        msg += f"\n\nOutput before timeout:\n{partial}"
-                    raise RuntimeError(msg)
-                except (asyncio.TimeoutError, ProcessLookupError, OSError):
-                    # Interrupt didn't work -- kill as last resort
-                    try:
-                        self.process.kill()
-                        await self.process.wait()
-                    except ProcessLookupError:
-                        pass
-                    msg = (
-                        f"Execution timed out after {timeout}s. "
-                        f"Interrupt failed; session killed. "
-                        f"It will restart on next call."
-                    )
-                    if partial:
-                        msg += f"\n\nOutput before timeout:\n{partial}"
-                    raise RuntimeError(msg)
+                    await timer_task
+                except asyncio.CancelledError:
+                    pass
+                return reader_task.result()  # may raise RuntimeError if process died
+            else:
+                # Timer fired first -- reader is still alive
+                return _TimeoutResult(
+                    reader_task=reader_task,
+                    lines=lines,
+                    timeout=timeout,
+                )
         else:
-            return await read_until_sentinel()
+            return await self._read_until_sentinel(lines)
 
     async def kill(self) -> None:
         if self.process is not None and self.process.returncode is None:
