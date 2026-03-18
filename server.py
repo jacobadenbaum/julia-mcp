@@ -204,9 +204,12 @@ class JuliaSession:
             content = f"SUCCESS\n{job.result or ''}"
         else:
             content = f"ERROR\n{job.error or ''}"
-        tmp_path = job.sentinel_path.with_suffix(".tmp")
-        tmp_path.write_text(content)
-        tmp_path.rename(job.sentinel_path)
+        try:
+            tmp_path = job.sentinel_path.with_suffix(".tmp")
+            tmp_path.write_text(content)
+            tmp_path.rename(job.sentinel_path)
+        except (FileNotFoundError, OSError):
+            pass  # Sentinel dir already cleaned up (e.g., during shutdown)
 
     def _start_background_job(
         self,

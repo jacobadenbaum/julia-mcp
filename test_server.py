@@ -676,3 +676,109 @@ class TestMCPTools:
                 "julia_job_cancel", {"job_id": "nonexistent"}
             )
             assert "not found" in cancel.content[0].text.lower()
+
+    async def test_background_lifecycle_end_to_end(self):
+        """Full lifecycle: background -> status (running) -> wait -> status (completed) -> eval works again."""
+        async with mcp_client_session() as client:
+            # Background a job that takes ~3 seconds
+            result = await client.call_tool(
+                "julia_eval",
+                {"code": "sleep(3); println(\"bg_result\")", "timeout": 0},
+            )
+            text = result.content[0].text
+            assert "[BACKGROUNDED]" in text
+            job_id = text.split("job_id=")[1].split()[0]
+            sentinel = text.split("sentinel=")[1].strip()
+
+            # Status should be running
+            status = await client.call_tool(
+                "julia_job_status", {"job_id": job_id}
+            )
+            assert "running" in status.content[0].text.lower()
+
+            # Eval should be rejected
+            busy = await client.call_tool(
+                "julia_eval", {"code": "println(1)"}
+            )
+            assert "busy" in busy.content[0].text.lower()
+
+            # Wait for completion
+            await asyncio.sleep(5)
+
+            # Status should be completed
+            status = await client.call_tool(
+                "julia_job_status", {"job_id": job_id}
+            )
+            assert "completed" in status.content[0].text.lower()
+            assert "bg_result" in status.content[0].text
+
+            # Sentinel file should exist with correct format
+            assert os.path.exists(sentinel)
+            with open(sentinel) as f:
+                content = f.read()
+            assert content.startswith("SUCCESS")
+            assert "bg_result" in content
+
+            # Session should be available again
+            result2 = await client.call_tool(
+                "julia_eval", {"code": "println(\"after_bg\")"}
+            )
+            assert "after_bg" in result2.content[0].text
+
+    async def test_background_job_handles_process_death(self):
+        """If Julia dies during a background job, job should error and session should recover."""
+        async with mcp_client_session() as client:
+            # Background a long-running job
+            result = await client.call_tool(
+                "julia_eval", {"code": "sleep(300)", "timeout": 0}
+            )
+            text = result.content[0].text
+            job_id = text.split("job_id=")[1].split()[0]
+            sentinel = text.split("sentinel=")[1].strip()
+
+            # Kill the Julia process externally
+            key = server_mod.manager._key(None)
+            session = server_mod.manager._sessions[key]
+            session.process.kill()
+            await session.process.wait()
+
+            # Wait for the reader task to detect the death
+            await asyncio.sleep(1)
+
+            # Status should be error
+            status = await client.call_tool(
+                "julia_job_status", {"job_id": job_id}
+            )
+            assert "error" in status.content[0].text.lower()
+
+            # Sentinel file should exist with ERROR prefix
+            assert os.path.exists(sentinel)
+            with open(sentinel) as f:
+                content = f.read()
+            assert content.startswith("ERROR")
+
+            # Next eval should start a fresh session
+            result2 = await client.call_tool(
+                "julia_eval", {"code": "println(\"recovered\")"}
+            )
+            assert "recovered" in result2.content[0].text
+
+    async def test_job_cancel_writes_sentinel(self):
+        """Cancel should write sentinel file so Bash poller doesn't hang."""
+        async with mcp_client_session() as client:
+            result = await client.call_tool(
+                "julia_eval", {"code": "sleep(300)", "timeout": 0}
+            )
+            text = result.content[0].text
+            job_id = text.split("job_id=")[1].split()[0]
+            sentinel = text.split("sentinel=")[1].strip()
+
+            await client.call_tool(
+                "julia_job_cancel", {"job_id": job_id}
+            )
+
+            # Wait for reader task cleanup
+            await asyncio.sleep(2)
+
+            # Sentinel file should exist (so Bash poller triggers)
+            assert os.path.exists(sentinel)
