@@ -647,3 +647,32 @@ class TestMCPTools:
                 "julia_job_status", {"job_id": "nonexistent"}
             )
             assert "not found" in status.content[0].text.lower()
+
+    async def test_job_cancel(self):
+        async with mcp_client_session() as client:
+            result = await client.call_tool(
+                "julia_eval", {"code": "sleep(300)", "timeout": 0}
+            )
+            text = result.content[0].text
+            job_id = text.split("job_id=")[1].split()[0]
+
+            cancel = await client.call_tool(
+                "julia_job_cancel", {"job_id": job_id}
+            )
+            assert not cancel.isError
+
+            # Wait for session cleanup
+            await asyncio.sleep(2)
+
+            # Session should be available again
+            result2 = await client.call_tool(
+                "julia_eval", {"code": "println(\"after_cancel\")"}
+            )
+            assert "after_cancel" in result2.content[0].text
+
+    async def test_job_cancel_unknown_id(self):
+        async with mcp_client_session() as client:
+            cancel = await client.call_tool(
+                "julia_job_cancel", {"job_id": "nonexistent"}
+            )
+            assert "not found" in cancel.content[0].text.lower()

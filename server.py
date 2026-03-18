@@ -4,6 +4,7 @@ import getpass
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -218,7 +219,7 @@ class JuliaSession:
         sentinel_path = manager._sentinel_dir / f"{job_id}.sentinel"
         job = BackgroundJob(
             job_id=job_id,
-            env_path=self.env_dir,
+            env_path=None if self.is_temp else self.env_dir,
             started_at=time.time(),
             lines=lines,
             status="running",
@@ -506,6 +507,58 @@ async def julia_job_status(job_id: str) -> str:
         if job.error:
             msg += f"\n\nError:\n{job.error}"
         return msg
+
+
+@mcp.tool()
+async def julia_job_cancel(job_id: str) -> str:
+    """Cancel a running background Julia job.
+
+    Sends interrupt signal to Julia. Session stays alive for future use.
+
+    Args:
+        job_id: The job ID to cancel.
+    """
+    job = manager._completed_jobs.get(job_id)
+    if job is None:
+        return f"Error: job '{job_id}' not found."
+    if job.status != "running":
+        return f"Job '{job_id}' is already {job.status}."
+
+    # Find the session that owns this job
+    key = manager._key(job.env_path)
+    session = manager._sessions.get(key)
+    if session is None or not session.is_alive():
+        return f"Error: session for job '{job_id}' is no longer available."
+
+    async with session.lock:
+        try:
+            session.process.send_signal(signal.SIGINT)
+            await asyncio.sleep(0.1)
+            session.process.send_signal(signal.SIGINT)
+        except (ProcessLookupError, OSError):
+            pass
+
+    # Wait for the reader task to finish (up to 10s)
+    if job.reader_task is not None:
+        try:
+            await asyncio.wait_for(job.reader_task, timeout=10.0)
+        except asyncio.TimeoutError:
+            # Reader didn't finish -- kill the process
+            try:
+                session.process.kill()
+                await session.process.wait()
+            except (ProcessLookupError, OSError):
+                pass
+            job.status = "error"
+            job.error = "Cancelled (process killed after interrupt failed)"
+            session._write_sentinel(job)
+            session._background_job = None
+
+    partial = "\n".join(job.lines)
+    msg = f"Job '{job_id}' cancelled."
+    if partial:
+        msg += f"\n\nPartial output:\n{partial}"
+    return msg
 
 
 @mcp.tool()
