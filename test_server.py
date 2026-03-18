@@ -609,3 +609,41 @@ class TestMCPTools:
             )
             assert "fast" in result.content[0].text
             assert "[BACKGROUNDED]" not in result.content[0].text
+
+    async def test_job_status_running(self):
+        async with mcp_client_session() as client:
+            result = await client.call_tool(
+                "julia_eval", {"code": "sleep(30); println(\"done\")", "timeout": 0}
+            )
+            text = result.content[0].text
+            job_id = text.split("job_id=")[1].split()[0]
+
+            status = await client.call_tool(
+                "julia_job_status", {"job_id": job_id}
+            )
+            assert "running" in status.content[0].text.lower()
+
+    async def test_job_status_completed(self):
+        async with mcp_client_session() as client:
+            result = await client.call_tool(
+                "julia_eval", {"code": "println(\"result_123\")", "timeout": 0}
+            )
+            text = result.content[0].text
+            job_id = text.split("job_id=")[1].split()[0]
+
+            # Wait for it to complete
+            await asyncio.sleep(5)
+
+            status = await client.call_tool(
+                "julia_job_status", {"job_id": job_id}
+            )
+            status_text = status.content[0].text
+            assert "completed" in status_text.lower()
+            assert "result_123" in status_text
+
+    async def test_job_status_unknown_id(self):
+        async with mcp_client_session() as client:
+            status = await client.call_tool(
+                "julia_job_status", {"job_id": "nonexistent"}
+            )
+            assert "not found" in status.content[0].text.lower()

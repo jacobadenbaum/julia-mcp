@@ -473,6 +473,42 @@ async def julia_eval(
 
 
 @mcp.tool()
+async def julia_job_status(job_id: str) -> str:
+    """Check status of a background Julia job.
+
+    Args:
+        job_id: The job ID returned by julia_eval when a job was backgrounded.
+
+    Returns:
+        Job status (running/completed/error) and output.
+    """
+    job = manager._completed_jobs.get(job_id)
+    if job is None:
+        return f"Error: job '{job_id}' not found."
+
+    elapsed = int(time.time() - job.started_at)
+
+    if job.status == "running":
+        partial = "\n".join(job.lines)
+        msg = f"Status: running ({elapsed}s elapsed)"
+        if partial:
+            msg += f"\n\nPartial output:\n{partial}"
+        return msg
+    elif job.status == "completed":
+        job.delivered = True
+        msg = f"Status: completed ({elapsed}s elapsed)"
+        if job.result:
+            msg += f"\n\nOutput:\n{job.result}"
+        return msg
+    else:  # error
+        job.delivered = True
+        msg = f"Status: error ({elapsed}s elapsed)"
+        if job.error:
+            msg += f"\n\nError:\n{job.error}"
+        return msg
+
+
+@mcp.tool()
 async def julia_restart(env_path: str | None = None) -> str:
     """Restart a Julia session, clearing all state.
 
