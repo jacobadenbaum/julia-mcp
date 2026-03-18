@@ -121,10 +121,10 @@ class TestJuliaSession:
         result = await s2.execute("println(1 + 1)", timeout=30.0)
         assert result == "2"
 
-    async def test_timeout_raises_but_session_survives(self, session: JuliaSession):
-        with pytest.raises(RuntimeError, match="timed out"):
-            await session.execute("sleep(60)", timeout=2.0)
-        # Session stays alive so it can be reused or backgrounded
+    async def test_timeout_backgrounds_instead_of_raising(self, session: JuliaSession):
+        """Timeout should background the job, not raise an error."""
+        result = await session.execute("sleep(60)", timeout=2.0)
+        assert "[BACKGROUNDED]" in result
         assert session.is_alive()
 
     async def test_is_alive(self, session: JuliaSession):
@@ -402,6 +402,31 @@ class TestBackgroundJob:
         assert job.delivered is False
 
 
+# -- Background execution tests --
+
+
+class TestBackgroundExecution:
+    async def test_auto_background_on_timeout(self, session: JuliaSession):
+        """When execute() times out, it should return a backgrounded message."""
+        result = await session.execute("sleep(10); println(\"done\")", timeout=1.0)
+        assert "[BACKGROUNDED]" in result
+        assert "job_id=" in result
+        assert "sentinel=" in result
+
+    async def test_session_busy_after_background(self, session: JuliaSession):
+        """After a job is backgrounded, the session should reject new execute() calls."""
+        result = await session.execute("sleep(60)", timeout=1.0)
+        assert "[BACKGROUNDED]" in result
+        result2 = await session.execute("println(1)", timeout=5.0)
+        assert "busy" in result2.lower()
+
+    async def test_timeout_zero_backgrounds_immediately(self, session: JuliaSession):
+        """timeout=0 should background the job immediately."""
+        result = await session.execute("println(\"fast\")", timeout=0)
+        assert "[BACKGROUNDED]" in result
+        assert session.is_alive()
+
+
 # -- End-to-end MCP tool tests --
 
 
@@ -540,40 +565,31 @@ class TestMCPTools:
             finally:
                 shutil.rmtree(tmpdir)
 
-    async def test_eval_timeout(self):
+    async def test_eval_timeout_backgrounds(self):
         async with mcp_client_session() as client:
             result = await client.call_tool(
                 "julia_eval", {"code": "sleep(60)", "timeout": 2.0}
             )
-            assert "timed out" in result.content[0].text
+            assert "[BACKGROUNDED]" in result.content[0].text
 
-    async def test_eval_timeout_includes_partial_output(self):
+    async def test_eval_timeout_backgrounds_with_partial_output(self):
         async with mcp_client_session() as client:
             code = 'println("before_timeout"); sleep(60)'
             result = await client.call_tool(
                 "julia_eval", {"code": code, "timeout": 1.0}
             )
             text = result.content[0].text
-            assert "timed out" in text
-            assert "before_timeout" in text
+            # Job is backgrounded, not errored
+            assert "[BACKGROUNDED]" in text
 
-    async def test_eval_timeout_multiple_lines_partial_output(self):
-        async with mcp_client_session() as client:
-            code = 'for i in 1:5; println("line_$i"); end; sleep(60)'
-            result = await client.call_tool(
-                "julia_eval", {"code": code, "timeout": 1.0}
-            )
-            text = result.content[0].text
-            assert "timed out" in text
-            for i in range(1, 6):
-                assert f"line_{i}" in text
-
-    async def test_eval_timeout_no_output_no_section(self):
-        """When nothing was printed before timeout, don't show an empty output section."""
+    async def test_eval_timeout_session_busy_after_background(self):
         async with mcp_client_session() as client:
             result = await client.call_tool(
                 "julia_eval", {"code": "sleep(60)", "timeout": 1.0}
             )
-            text = result.content[0].text
-            assert "timed out" in text
-            assert "Output before timeout" not in text
+            assert "[BACKGROUNDED]" in result.content[0].text
+            # Second call should report session busy
+            result2 = await client.call_tool(
+                "julia_eval", {"code": "println(1)", "timeout": 5.0}
+            )
+            assert "busy" in result2.content[0].text.lower()

@@ -3,7 +3,6 @@ import atexit
 import getpass
 import os
 import re
-import signal
 import shutil
 import subprocess
 import sys
@@ -68,6 +67,7 @@ class JuliaSession:
         self.process: asyncio.subprocess.Process | None = None
         self.lock = asyncio.Lock()
         self._log_file = log_file
+        self._background_job: BackgroundJob | None = None
 
     @property
     def project_path(self) -> str:
@@ -123,10 +123,21 @@ class JuliaSession:
         return self.process is not None and self.process.returncode is None
 
     async def execute(self, code: str, timeout: float | None) -> str:
+        # Busy check: before the lock, return immediately
+        if self._background_job is not None:
+            job = self._background_job
+            return (
+                f"Session busy: background job {job.job_id} is running "
+                f"(started {int(time.time() - job.started_at)}s ago). "
+                f"Use julia_job_status(\"{job.job_id}\") to check progress, "
+                f"or julia_job_cancel(\"{job.job_id}\") to abort. "
+                f"For independent work, use a background Bash julia command."
+            )
+
         async with self.lock:
             if not self.is_alive():
                 raise RuntimeError("Julia session has died unexpectedly")
-            # hex-encode to avoid string escaping issues; include_string for sequential parse-eval (macros work)
+
             hex_encoded = code.encode().hex()
             wrapped = (
                 f'try; Revise.revise(); catch; end;'
@@ -138,33 +149,35 @@ class JuliaSession:
                 self._log_file.write(f"[{ts}] julia> {code}\n")
                 self._log_file.flush()
 
+            # timeout=0: background immediately (inside the lock -- we write to stdin)
+            if timeout is not None and timeout == 0:
+                assert self.process.stdin is not None
+                sentinel_cmd = (
+                    f'flush(stderr); write(stdout, "\\n"); '
+                    f'println(stdout, "{self.sentinel}"); flush(stdout)'
+                )
+                payload = wrapped + "\n" + sentinel_cmd + "\n"
+                self.process.stdin.write(payload.encode())
+                await self.process.stdin.drain()
+
+                lines: list[str] = []
+                return self._start_background_job(
+                    lines, lines, "immediate background (timeout=0)"
+                )
+
+            # Normal path: foreground with possible auto-background
             result = await self._execute_raw(wrapped, timeout)
 
             if isinstance(result, _TimeoutResult):
-                # Temporary: maintain old behavior until auto-backgrounding is added in Task 3
-                partial = "\n".join(result.lines)
-                # Cancel the reader and interrupt Julia
-                result.reader_task.cancel()
-                try:
-                    await result.reader_task
-                except (asyncio.CancelledError, RuntimeError):
-                    pass
-                try:
-                    self.process.send_signal(signal.SIGINT)
-                    await asyncio.sleep(0.1)
-                    self.process.send_signal(signal.SIGINT)
-                except (ProcessLookupError, OSError):
-                    pass
-                msg = f"Execution timed out after {result.timeout}s."
-                if partial:
-                    msg += f"\n\nOutput before timeout:\n{partial}"
-                raise RuntimeError(msg)
+                return self._start_background_job(
+                    result.reader_task, result.lines,
+                    f"auto-backgrounded after {result.timeout}s",
+                )
 
-            output = result
-            if self._log_file and output:
-                self._log_file.write(f"{output}\n\n")
+            if self._log_file and result:
+                self._log_file.write(f"{result}\n\n")
                 self._log_file.flush()
-            return output
+            return result
 
     async def _read_until_sentinel(self, lines: list[str]) -> str:
         """Read stdout lines until the sentinel marker appears."""
@@ -183,6 +196,76 @@ class JuliaSession:
         if lines and lines[-1] == "":
             lines.pop()
         return "\n".join(lines)
+
+    def _write_sentinel(self, job: BackgroundJob) -> None:
+        """Atomically write job result to sentinel file."""
+        if job.status == "completed":
+            content = f"SUCCESS\n{job.result or ''}"
+        else:
+            content = f"ERROR\n{job.error or ''}"
+        tmp_path = job.sentinel_path.with_suffix(".tmp")
+        tmp_path.write_text(content)
+        tmp_path.rename(job.sentinel_path)
+
+    def _start_background_job(
+        self,
+        reader_task_or_lines: asyncio.Task | list[str],
+        lines: list[str],
+        reason: str,
+    ) -> str:
+        """Create a BackgroundJob wrapping an existing or new reader task."""
+        job_id = uuid.uuid4().hex[:8]
+        sentinel_path = manager._sentinel_dir / f"{job_id}.sentinel"
+        job = BackgroundJob(
+            job_id=job_id,
+            env_path=self.env_dir,
+            started_at=time.time(),
+            lines=lines,
+            status="running",
+            result=None,
+            error=None,
+            reader_task=None,
+            delivered=False,
+            sentinel_path=sentinel_path,
+        )
+
+        if isinstance(reader_task_or_lines, asyncio.Task):
+            existing_reader = reader_task_or_lines
+        else:
+            existing_reader = asyncio.create_task(
+                self._read_until_sentinel(reader_task_or_lines)
+            )
+
+        async def _run_bg():
+            try:
+                output = await existing_reader
+                job.result = output
+                job.status = "completed"
+            except RuntimeError as e:
+                job.error = str(e)
+                job.status = "error"
+            finally:
+                self._write_sentinel(job)
+                self._background_job = None
+                if self._log_file:
+                    ts = time.strftime("%H:%M:%S")
+                    status_str = job.status.upper()
+                    out = job.result or job.error or ""
+                    self._log_file.write(
+                        f"[{ts}] [BG {job.job_id} {status_str}] {out}\n\n"
+                    )
+                    self._log_file.flush()
+
+        job.reader_task = asyncio.create_task(_run_bg())
+        self._background_job = job
+        manager._completed_jobs[job_id] = job
+
+        if self._log_file:
+            ts = time.strftime("%H:%M:%S")
+            self._log_file.write(f"[{ts}] [BG {job.job_id} STARTED] {reason}\n")
+            self._log_file.flush()
+
+        return f"[BACKGROUNDED] job_id={job_id} sentinel={sentinel_path}"
 
     async def _execute_raw(
         self, code: str, timeout: float | None
@@ -370,6 +453,8 @@ async def julia_eval(
         effective_timeout: float | None = (
             None if PKG_PATTERN.search(code) else DEFAULT_TIMEOUT
         )
+    elif timeout == 0:
+        effective_timeout = 0  # immediate background
     else:
         effective_timeout = timeout if timeout > 0 else None
 
