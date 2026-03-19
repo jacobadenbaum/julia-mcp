@@ -170,10 +170,18 @@ class JuliaSession:
             result = await self._execute_raw(wrapped, timeout)
 
             if isinstance(result, _TimeoutResult):
-                return self._start_background_job(
-                    result.reader_task, result.lines,
-                    f"auto-backgrounded after {result.timeout}s",
-                )
+                try:
+                    return self._start_background_job(
+                        result.reader_task, result.lines,
+                        f"auto-backgrounded after {result.timeout}s",
+                    )
+                except Exception:
+                    result.reader_task.cancel()
+                    try:
+                        await result.reader_task
+                    except (asyncio.CancelledError, Exception):
+                        pass
+                    raise
 
             if self._log_file and result:
                 self._log_file.write(f"{result}\n\n")
@@ -219,6 +227,7 @@ class JuliaSession:
     ) -> str:
         """Create a BackgroundJob wrapping an existing or new reader task."""
         job_id = uuid.uuid4().hex[:8]
+        manager._sentinel_dir.mkdir(parents=True, exist_ok=True)
         sentinel_path = manager._sentinel_dir / f"{job_id}.sentinel"
         output_path = manager._sentinel_dir / f"{job_id}.log"
         # Create the output file immediately so tail -f can attach
@@ -364,12 +373,15 @@ class SessionManager:
         self._sentinel_dir.mkdir(parents=True, exist_ok=True)
         self._completed_jobs: dict[str, BackgroundJob] = {}
         # Clean up stale sentinel dirs from crashed previous runs
-        for stale in SENTINEL_BASE.iterdir():
-            if stale != self._sentinel_dir and stale.is_dir():
-                try:
-                    shutil.rmtree(stale)
-                except OSError:
-                    pass
+        try:
+            for stale in SENTINEL_BASE.iterdir():
+                if stale != self._sentinel_dir and stale.is_dir():
+                    try:
+                        shutil.rmtree(stale)
+                    except OSError:
+                        pass
+        except FileNotFoundError:
+            pass
         atexit.register(self._cleanup_logs)
 
     def _get_log_file(self, key: str) -> TextIOWrapper:
