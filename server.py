@@ -282,6 +282,10 @@ class JuliaSession:
                 output = await existing_reader
                 job.result = output
                 job.status = "completed"
+            except asyncio.CancelledError:
+                job.error = "Cancelled"
+                job.status = "error"
+                raise
             except RuntimeError as e:
                 job.error = str(e)
                 job.status = "error"
